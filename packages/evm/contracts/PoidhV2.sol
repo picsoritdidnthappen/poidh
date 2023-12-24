@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.23;
 
-import '@openzeppelin/contracts/token/ERC721/ERC721.sol';
-import '@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol';
-import '@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol';
-import '@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol';
-import '@openzeppelin/contracts/token/ERC721/extensions/ERC721Royalty.sol';
+import '@openzeppelin/contracts/token/ERC721/IERC721.sol';
 
-contract PoidhV2 is
-    ERC721,
-    ERC721Enumerable,
-    ERC721URIStorage,
-    IERC721Receiver,
-    ERC721Royalty
-{
+interface PoidhV2Nft is IERC721 {
+    function setTokenURI(uint256 tokenId, string memory _tokenURI) external;
+    function mint(address to, uint256 claimCounter) external;
+    function safeTransfer(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory _data
+    ) external;
+}
+
+contract PoidhV2 {
     /** Data structures */
     struct Bounty {
         uint256 id;
@@ -26,6 +27,22 @@ contract PoidhV2 is
         uint256 claimId;
     }
 
+    struct ViewBounty {
+        uint256 id;
+        address issuer;
+        string name;
+        string description;
+        uint256 amount;
+        address claimer;
+        uint256 createdAt;
+        uint256 claimId;
+        address[] participants;
+        uint256[] participantAmounts;
+        uint256 yesVotes;
+        uint256 noVotes;
+        uint256 deadline;
+    }
+
     struct Claim {
         uint256 id;
         address issuer;
@@ -34,6 +51,7 @@ contract PoidhV2 is
         string name;
         string description;
         uint256 createdAt;
+        bool accepted;
     }
 
     struct Votes {
@@ -52,6 +70,10 @@ contract PoidhV2 is
     uint256 public claimCounter = 1;
 
     uint256 public votingPeriod = 2 days;
+
+    address public immutable poidhAuthority;
+    bool public poidhV2NftSet = false;
+    PoidhV2Nft public immutable poidhV2Nft;
 
     /** mappings */
     mapping(address => uint256[]) public userBounties;
@@ -106,18 +128,34 @@ contract PoidhV2 is
     error NoVotingPeriodSet();
     error NotActiveParticipant();
     error BountyAmountTooHigh();
+    error IssuerCannotWithdraw();
 
-    /**
-     * @dev Constructor function
-     * @param _treasury the address of the treasury wallet
-     * @param _feeNumerator the fee numerator for the royalty (1000 ~ 10%)
+    /** modifiers */
+    /** @dev
+     * Checks if the bounty exists
+     * Checks if the bounty is claimed
+     * Checks if the bounty is open
+     * Checks if the bounty is currently being voted on
      */
-    constructor(
-        address _treasury,
-        uint96 _feeNumerator
-    ) ERC721("pics or it didnt happen", 'POIDH V2') {
+
+    modifier bountyChecks(uint256 bountyId) {
+        if (bountyId >= bountyCounter) revert BountyNotFound();
+        Bounty memory bounty = bounties[bountyId];
+        if (bounty.claimer != address(0)) revert BountyClaimed();
+        if (bounty.claimer == bounty.issuer) revert BountyClosed();
+        _;
+    }
+
+    modifier openBountyChecks(uint256 bountyId) {
+        if (bountyCurrentVotingClaim[bountyId] > 0) revert VotingOngoing();
+        address[] memory p = participants[bountyId];
+        if (p.length == 0) revert NotOpenBounty();
+        _;
+    }
+
+    constructor(address _poidhV2Nft, address _treasury) {
+        poidhV2Nft = PoidhV2Nft(_poidhV2Nft);
         treasury = _treasury;
-        _setDefaultRoyalty(_treasury, _feeNumerator);
     }
 
     /** Create Solo Bounty */
@@ -200,16 +238,12 @@ contract PoidhV2 is
      * @dev Allows the sender join an open bounty as a participant with msg.value shares
      * @param bountyId the id of the bounty to be joined
      */
-    function joinOpenBounty(uint256 bountyId) external payable {
+    function joinOpenBounty(
+        uint256 bountyId
+    ) external payable bountyChecks(bountyId) openBountyChecks(bountyId) {
         if (msg.value == 0) revert NoEther();
-        if (bountyId >= bountyCounter) revert BountyNotFound();
-        if (bountyCurrentVotingClaim[bountyId] > 0) revert VotingOngoing();
 
         Bounty memory bounty = bounties[bountyId];
-        if (bounty.claimer != address(0)) revert BountyClaimed();
-
-        address[] memory p = participants[bountyId];
-        if (p.length == 0) revert NotOpenBounty();
 
         participants[bountyId].push(msg.sender);
         participantAmounts[bountyId].push(msg.value);
@@ -223,14 +257,9 @@ contract PoidhV2 is
      * @dev Allows the sender to cancel a bounty with a given id
      * @param bountyId the id of the bounty to be canceled
      */
-    function cancelSoloBounty(uint bountyId) external {
-        if (bountyId >= bountyCounter) revert BountyNotFound();
-
+    function cancelSoloBounty(uint bountyId) external bountyChecks(bountyId) {
         Bounty memory bounty = bounties[bountyId];
         if (msg.sender != bounty.issuer) revert WrongCaller();
-
-        if (bounty.claimer != address(0)) revert BountyClaimed();
-        if (bounty.claimer == msg.sender) revert BountyClosed();
 
         address[] memory p = participants[bountyId];
         if (p.length > 0) revert NotSoloBounty();
@@ -245,24 +274,24 @@ contract PoidhV2 is
     }
 
     /** Cancel Open Bounty */
-    function cancelOpenBounty(uint256 bountyId) external {
-        if (bountyId >= bountyCounter) revert BountyNotFound();
-        if (bountyCurrentVotingClaim[bountyId] > 0) revert VotingOngoing();
-
+    function cancelOpenBounty(
+        uint256 bountyId
+    ) external bountyChecks(bountyId) openBountyChecks(bountyId) {
         Bounty memory bounty = bounties[bountyId];
         if (msg.sender != bounty.issuer) revert WrongCaller();
-        if (bounty.claimer != address(0)) revert BountyClaimed();
-        if (bounty.claimer == msg.sender) revert BountyClosed();
 
         address[] memory p = participants[bountyId];
-        if (p.length == 0) revert NotOpenBounty();
-
         uint256[] memory amounts = participantAmounts[bountyId];
         uint256 i;
 
         do {
             address participant = p[i];
             uint256 amount = amounts[i];
+
+            if (participant == address(0)) {
+                ++i;
+                continue;
+            }
 
             (bool success, ) = participant.call{value: amount}('');
             if (!success) revert transferFailed();
@@ -285,12 +314,8 @@ contract PoidhV2 is
         string calldata name,
         string calldata uri,
         string calldata description
-    ) external {
-        if (bountyId >= bountyCounter) revert BountyNotFound();
-
+    ) external bountyChecks(bountyId) {
         Bounty memory bounty = bounties[bountyId];
-        if (bounty.claimer != address(0)) revert BountyClaimed();
-        if (bounty.claimer == msg.sender) revert BountyClosed();
         if (bounty.issuer == msg.sender) revert IssuerCannotClaim();
 
         uint256 claimId = claimCounter;
@@ -302,15 +327,16 @@ contract PoidhV2 is
             bounty.issuer,
             name,
             description, // new field
-            block.timestamp
+            block.timestamp,
+            false
         );
 
         claims.push(claim);
         userClaims[msg.sender].push(claimId);
         bountyClaims[bountyId].push(claimId);
 
-        _mint(address(this), claimId);
-        _setTokenURI(claimId, uri);
+        poidhV2Nft.mint(address(this), claimId);
+        poidhV2Nft.setTokenURI(claimId, uri);
 
         emit ClaimCreated(
             claimId,
@@ -327,24 +353,13 @@ contract PoidhV2 is
      * @dev Bounty issuer submits claim for voting and casts their vote
      * @param bountyId the id of the bounty being claimed
      */
-    function submitClaimForVote(uint256 bountyId, uint256 claimId) external {
-        if (bountyId >= bountyCounter) revert BountyNotFound();
+    function submitClaimForVote(
+        uint256 bountyId,
+        uint256 claimId
+    ) external bountyChecks(bountyId) openBountyChecks(bountyId) {
         if (claimId >= claimCounter) revert ClaimNotFound();
 
-        Bounty memory bounty = bounties[bountyId];
-        if (bounty.claimer != address(0)) revert BountyClaimed();
-        if (bounty.claimer == bounty.issuer) revert BountyClosed();
-
-        address[] memory p = participants[bountyId];
-        if (p.length == 0) revert NotOpenBounty();
-
         uint256[] memory amounts = participantAmounts[bountyId];
-
-        if (amounts[0] > bounty.amount / 2) {
-            // Automatically accept claim if yes
-            acceptClaim(bountyId, claimId);
-            return;
-        }
 
         Votes storage votingTracker = bountyVotingTracker[bountyId];
         votingTracker.yes += amounts[0];
@@ -358,13 +373,10 @@ contract PoidhV2 is
      * @dev Vote on an open bounty
      * @param bountyId the id of the bounty to vote for
      */
-    function voteClaim(uint256 bountyId, bool vote) external {
-        if (bountyId >= bountyCounter) revert BountyNotFound();
-
-        Bounty memory bounty = bounties[bountyId];
-        if (bounty.claimer != address(0)) revert BountyClaimed();
-        if (bounty.claimer == bounty.issuer) revert BountyClosed();
-
+    function voteClaim(
+        uint256 bountyId,
+        bool vote
+    ) external bountyChecks(bountyId) {
         address[] memory p = participants[bountyId];
         if (p.length == 0) revert NotOpenBounty();
 
@@ -389,7 +401,10 @@ contract PoidhV2 is
         Votes memory votingTracker = bountyVotingTracker[bountyId];
 
         if (vote) {
-            if (votingTracker.yes + participantAmount > bounty.amount / 2) {
+            if (
+                votingTracker.yes + participantAmount >
+                (votingTracker.yes + votingTracker.no) / 2
+            ) {
                 // accept claim and close out bounty
                 acceptClaim(bountyId, currentClaim);
                 return;
@@ -404,60 +419,31 @@ contract PoidhV2 is
      * @dev Reset the voting period for an open bounty
      * @param bountyId the id of the bounty being claimed
      */
-    function resetVotingPeriod(uint256 bountyId) external {
-        if (bountyId >= bountyCounter) revert BountyNotFound();
-
-        Bounty memory bounty = bounties[bountyId];
-        if (bounty.claimer != address(0)) revert BountyClaimed();
-        if (bounty.claimer == bounty.issuer) revert BountyClosed();
-
-        address[] memory p = participants[bountyId];
-        if (p.length == 0) revert NotOpenBounty();
+    function resetVotingPeriod(
+        uint256 bountyId
+    ) external bountyChecks(bountyId) {
+        if (participants[bountyId].length == 0) revert NotOpenBounty();
 
         uint256 currentClaim = bountyCurrentVotingClaim[bountyId];
         if (currentClaim == 0) revert NoVotingPeriodSet();
 
-        uint256[] memory amounts = participantAmounts[bountyId];
-        uint256 i;
-        uint256 participantAmount;
-
-        do {
-            if (msg.sender == p[i]) {
-                participantAmount = amounts[i];
-                break;
-            }
-
-            ++i;
-        } while (i < p.length);
-
-        if (participantAmount == 0) revert NotActiveParticipant();
-
         Votes storage votingTracker = bountyVotingTracker[bountyId];
-
         if (block.timestamp < votingTracker.deadline) revert VotingOngoing();
 
         bountyCurrentVotingClaim[bountyId] = 0;
-        bountyVotingTracker[bountyId].yes = 0;
-        bountyVotingTracker[bountyId].no = 0;
-        bountyVotingTracker[bountyId].deadline = 0;
+        delete bountyVotingTracker[bountyId];
     }
 
     /**
      * @dev Allow bounty participants to withdraw from a bounty that is not currently being voted on
      * @param bountyId the id of the bounty to withdraw from
      */
-    function withdrawFromOpenBounty(uint256 bountyId) external {
-        if (bountyId >= bountyCounter) revert BountyNotFound();
-
+    function withdrawFromOpenBounty(
+        uint256 bountyId
+    ) external bountyChecks(bountyId) openBountyChecks(bountyId) {
         Bounty memory bounty = bounties[bountyId];
-        if (bounty.claimer != address(0)) revert BountyClaimed();
-        if (bounty.claimer == bounty.issuer) revert BountyClosed();
-
+        if (bounty.issuer == msg.sender) revert IssuerCannotWithdraw();
         address[] memory p = participants[bountyId];
-        if (p.length == 0) revert NotOpenBounty();
-
-        if (bountyCurrentVotingClaim[bountyId] > 0) revert VotingOngoing();
-
         uint256[] memory amounts = participantAmounts[bountyId];
         uint256 i;
 
@@ -483,13 +469,13 @@ contract PoidhV2 is
      * @param bountyId the id of the bounty being claimed
      * @param claimId the id of the claim being accepted
      */
-    function acceptClaim(uint256 bountyId, uint256 claimId) public {
-        if (bountyId >= bountyCounter) revert BountyNotFound();
+    function acceptClaim(
+        uint256 bountyId,
+        uint256 claimId
+    ) public bountyChecks(bountyId) {
         if (claimId >= claimCounter) revert ClaimNotFound();
 
         Bounty memory bounty = bounties[bountyId];
-        if (bounty.claimer != address(0)) revert BountyClaimed();
-        if (bounty.claimer == bounty.issuer) revert BountyClosed();
         if (bounty.amount > address(this).balance) revert BountyAmountTooHigh();
 
         address claimIssuer = claims[claimId].issuer;
@@ -498,6 +484,9 @@ contract PoidhV2 is
         // Close out the bounty
         bounties[bountyId].claimer = claimIssuer;
         bounties[bountyId].claimId = claimId;
+
+        Claim storage claim = claims[claimId];
+        claim.accepted = true;
 
         // Calculate the fee (2.5% of bountyAmount)
         uint256 fee = (bountyAmount * 25) / 1000;
@@ -513,7 +502,7 @@ contract PoidhV2 is
         address payable t = payable(treasury); // replace 'treasury_address_here' with your actual treasury address
 
         // Transfer the claim NFT to the bounty issuer
-        _safeTransfer(address(this), msg.sender, claimId, '');
+        poidhV2Nft.safeTransfer(address(this), msg.sender, claimId, '');
 
         // Finally, transfer the bounty amount to the claim issuer
         (bool s1, ) = pendingPayee.call{value: pendingPayment}('');
@@ -532,31 +521,35 @@ contract PoidhV2 is
 
     /**
      * @dev Returns an array of Bounties from start to end index
-     * @param start the index to start fetching bounties from
-     * @param end the index to stop fetching bounties at
+     * @param offset the index to start fetching bounties from
      * @return result an array of Bounties from start to end index
      */
     function getBounties(
-        uint start,
-        uint end
-    ) public view returns (Bounty[] memory) {
-        require(
-            start <= end,
-            'Start index must be less than or equal to end index'
-        );
-        require(end < bounties.length, 'End index out of bounds');
+        uint offset
+    ) public view returns (ViewBounty[10] memory result) {
+        require(offset + 10 <= bounties.length, 'End index out of bounds');
 
-        // Calculate the size of the array to return
-        uint size = end - start + 1;
-        // Initialize an array of Bounties with the calculated size
-        Bounty[] memory result = new Bounty[](size);
+        for (uint i = 0; i < 10; i++) {
+            Bounty storage bounty = bounties[offset + i];
 
-        // Loop from start to end index and populate the result array
-        for (uint i = 0; i < size; i++) {
-            result[i] = bounties[start + i];
+            Votes storage vote = bountyVotingTracker[bounty.id];
+
+            result[i] = ViewBounty({
+                id: bounty.id,
+                issuer: bounty.issuer,
+                name: bounty.name,
+                description: bounty.description,
+                amount: bounty.amount,
+                claimer: bounty.claimer,
+                createdAt: bounty.createdAt,
+                claimId: bounty.claimId,
+                participants: participants[bounty.id],
+                participantAmounts: participantAmounts[bounty.id],
+                yesVotes: vote.yes,
+                noVotes: vote.no,
+                deadline: vote.deadline
+            });
         }
-
-        return result;
     }
 
     /** get claims by bountyId*/
@@ -585,18 +578,31 @@ contract PoidhV2 is
         @param user the address of the user to fetch bounties for
     */
     function getBountiesByUser(
-        address user
-    ) public view returns (Bounty[] memory) {
-        uint256[] storage userBountyIndexes = userBounties[user];
-        Bounty[] memory userBountiesArray = new Bounty[](
-            userBountyIndexes.length
-        );
+        address user,
+        uint256 offset
+    ) public view returns (ViewBounty[10] memory result) {
+        uint256[] memory bountyIds = userBounties[user];
 
-        for (uint256 i = 0; i < userBountyIndexes.length; i++) {
-            userBountiesArray[i] = bounties[userBountyIndexes[i]];
+        for (uint i = 0; i < 10; i++) {
+            Bounty storage b = bounties[bountyIds[offset + i]];
+            Votes storage v = bountyVotingTracker[b.id];
+
+            result[i] = ViewBounty({
+                id: b.id,
+                issuer: b.issuer,
+                name: b.name,
+                description: b.description,
+                amount: b.amount,
+                claimer: b.claimer,
+                createdAt: b.createdAt,
+                claimId: b.claimId,
+                participants: participants[b.id],
+                participantAmounts: participantAmounts[b.id],
+                yesVotes: v.yes,
+                noVotes: v.no,
+                deadline: v.deadline
+            });
         }
-
-        return userBountiesArray;
     }
 
     /** get claims by user */
@@ -615,47 +621,5 @@ contract PoidhV2 is
         }
 
         return userClaimsArray;
-    }
-
-    /** get claims by bounty */
-    function tokenURI(
-        uint256 tokenId
-    ) public view override(ERC721, ERC721URIStorage) returns (string memory) {
-        return super.tokenURI(tokenId);
-    }
-
-    function supportsInterface(
-        bytes4 interfaceId
-    )
-        public
-        view
-        override(ERC721, ERC721Enumerable, ERC721URIStorage, ERC721Royalty)
-        returns (bool)
-    {
-        return super.supportsInterface(interfaceId);
-    }
-
-    function _increaseBalance(
-        address account,
-        uint128 amount
-    ) internal virtual override(ERC721, ERC721Enumerable) {
-        super._increaseBalance(account, amount);
-    }
-
-    function _update(
-        address to,
-        uint256 tokenId,
-        address auth
-    ) internal virtual override(ERC721, ERC721Enumerable) returns (address) {
-        return super._update(to, tokenId, auth);
-    }
-
-    function onERC721Received(
-        address,
-        address,
-        uint256,
-        bytes memory
-    ) public virtual override returns (bytes4) {
-        return this.onERC721Received.selector;
     }
 }
